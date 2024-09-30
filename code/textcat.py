@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Computes the total log probability of the sequences of tokens in each file,
-according to a given smoothed trigram model.  
+Classifies text files as gen or spam using two language models and Bayes' Theorem
 """
 import argparse
 import logging
@@ -16,9 +15,19 @@ log = logging.getLogger(Path(__file__).stem)  # For usage, see findsim.py in ear
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "model",
+        "gen_model",
         type=Path,
-        help="path to the trained model",
+        help="path to the trained gen model",
+    )
+    parser.add_argument(
+        "spam_model",
+        type=Path,
+        help="path to the trained spam model", 
+    )
+    parser.add_argument(
+        "prior_gen",
+        type=float,
+        help="prior probability of the first category (gen)",
     )
     parser.add_argument(
         "test_files",
@@ -75,6 +84,22 @@ def file_log_prob(file: Path, lm: LanguageModel) -> float:
 
     return log_prob
 
+def classify_file(file: Path, gen_lm: LanguageModel, spam_lm: LanguageModel, prior_gen: float) -> str:
+  """Classify a file as gen or spam using two language models and Bayes' Theorem."""
+  log_prob_gen = file_log_prob(file, gen_lm)
+  log_prob_spam = file_log_prob(file, spam_lm)
+
+  # Bayes' Theorem: add log prior probabilities 
+  log_prior_gen = math.log(prior_gen)
+  log_prior_spam = math.log(1 - prior_gen)
+
+  # Posterior log-probabilities 
+  log_posterior_gen = log_prob_gen + log_prior_gen
+  log_posterior_spam = log_prob_spam + log_prior_spam
+
+  # Classify based on the larger posterior log-probability
+  return "gen" if log_posterior_gen > log_posterior_spam else "spam"
+
 
 def main():
     args = parse_args()
@@ -96,30 +121,33 @@ def main():
     torch.set_default_device(args.device)
         
     log.info("Testing...")
-    lm = LanguageModel.load(args.model, device=args.device)
+    # Load the two models
+    gen_lm = LanguageModel.load(args.gen_model, device=args.device)
+    spam_lm = LanguageModel.load(args.spam_model, device=args.device)
+
+    # Ensure both models have the same vocabulary 
+    if gen_lm.vocab != spam_lm.vocab:
+      raise ValueError("The vocabularies of the two models do not match. Please ensure both models are trained with the same vocabulary.")
     
-    # We use natural log for our internal computations and that's
-    # the kind of log-probability that file_log_prob returns.
-    # We'll print that first.
-
-    log.info("Per-file log-probabilities:")
-    total_log_prob = 0.0
+    # Classify each file
+    results = []
     for file in args.test_files:
-        log_prob: float = file_log_prob(file, lm)
-        print(f"{log_prob:g}\t{file}")
-        total_log_prob += log_prob
+        classification = classify_file(file, gen_lm, spam_lm, args.prior_gen)
+        model_name = args.gen_model.name if classification == "gen" else args.spam_model.name
+        print(f"{model_name}\t{file}")
+        results.append(classification)
 
-    # But cross-entropy is conventionally measured in bits: so when it's
-    # time to print cross-entropy, we convert log base e to log base 2, 
-    # by dividing by log(2).
+    # Calculate the number of files classified as gen and spam
+    num_gen = results.count("gen")
+    num_spam = results.count("spam")
+    total_files = len(results)
 
-    bits = -total_log_prob / math.log(2)   # convert to bits of surprisal
+    # Print summary with percentages
+    perc_gen = (num_gen / total_files) * 100 if total_files > 0 else 0
+    perc_spam = (num_spam / total_files) * 100 if total_files > 0 else 0
 
-    # We also divide by the # of tokens (including EOS tokens) to get
-    # bits per token.  (The division happens within the print statement.)
-
-    tokens = sum(num_tokens(test_file) for test_file in args.test_files)
-    print(f"Overall cross-entropy:\t{bits / tokens:.5f} bits per token")
+    print(f"\n{num_gen} files were more probably from {args.gen_model.name} ({perc_gen:.2f}%)")
+    print(f"{num_spam} files were more probably from {args.spam_model.name} ({perc_spam:.2f}%)")
 
 
 if __name__ == "__main__":
