@@ -318,11 +318,42 @@ class BackoffAddLambdaLanguageModel(AddLambdaLanguageModel):
         super().__init__(vocab, lambda_)
 
     def prob(self, x: Wordtype, y: Wordtype, z: Wordtype) -> float:
-        # TODO: Reimplement me so that I do backoff
-        return super().prob(x, y, z)
-        # Don't forget the difference between the Wordtype z and the
-        # 1-element tuple (z,). If you're looking up counts,
-        # these will have very different counts!
+        """Compute the probability p(z | xy) with backoff to p(z | y) and p(z) using add-λ smoothing."""
+        trigram_count = self.event_count[(x, y, z)]
+        bigram_count = self.context_count[(x, y)]
+        if bigram_count > 0:
+            # Add-λ smoothing for trigram
+            return (trigram_count + self.lambda_ * self.prob_bigram(y, z)) / (bigram_count + self.lambda_ * self.vocab_size)
+        else:
+            # Back off to bigram if trigram not seen
+            return self.prob_bigram(y, z) 
+
+    def prob_bigram(self, y: Wordtype, z: Wordtype) -> float:
+        """Compute the probability p(z | y) with backoff to p(z) using add-λ smoothing."""
+        
+        # Check if bigram (y, z) is present, otherwise back off to unigram
+        bigram_count = self.event_count[(y, z)]
+        unigram_count = self.context_count[(y,)]
+
+        if unigram_count > 0:
+            # Add-λ smoothing for bigram
+            return (bigram_count + self.lambda_ * self.prob_unigram(z)) / (unigram_count + self.lambda_ * self.vocab_size)
+        else:
+            # Back off to unigram if bigram not seen
+            return self.prob_unigram(z)
+    
+    def prob_unigram(self, z: Wordtype) -> float:
+    """Compute the unigram probability p(z) with add-λ smoothing."""
+    
+    unigram_count = self.event_count[(z,)]
+    total_count = self.event_count[()]  # Total number of events
+
+    # Add-λ smoothing for unigram
+    if total_count > 0:
+        return (unigram_count + self.lambda_) / (total_count + self.lambda_ * self.vocab_size)
+    else:
+        # Back off to uniform distribution if no counts exist
+        return 1 / self.vocab_size  
 
 
 class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
