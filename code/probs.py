@@ -264,6 +264,32 @@ class LanguageModel:
         self.progress += 1
         if self.progress % freq == 1:
             sys.stderr.write(".")
+    
+    def sample(self, k: int, max_length: int) -> List[List[Wordtype]]:
+        """Sample k sentences from the language model until EOS is reached or max_length is exceeded."""
+        generated_sentences = []
+        for _ in range(k):
+            x, y = BOS, BOS  # Start with the beginning of the sequence markers
+            sentence = []
+            for _ in range(max_length):
+                # Calculate the probability distribution over the vocab
+                probs = torch.tensor([self.prob(x, y, z) for z in self.vocab])
+                # Normalize the probabilities to ensure they sum to 1
+                if probs.sum() > 0:
+                    probs = probs / probs.sum()
+                # Sample the next word z given context (x, y)
+                z_idx = torch.multinomial(probs, 1).item()
+                z = list(self.vocab)[z_idx]
+                # Stop if EOS is sampled
+                if z == EOS:
+                    break
+                sentence.append(z)
+                x, y = y, z  # Shift the context for the next trigram
+            # If max_length is reached, append ellipsis
+            if len(sentence) == max_length:
+                sentence.append(".")
+            generated_sentences.append(sentence)
+        return generated_sentences
 
 
 ##### SPECIFIC FAMILIES OF LANGUAGE MODELS
