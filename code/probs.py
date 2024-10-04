@@ -23,6 +23,7 @@ import logging
 import math
 import sys
 import pickle
+import tqdm
 
 from pathlib import Path
 
@@ -383,9 +384,37 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         if l2 < 0:
             raise ValueError("Negative regularization strength {l2}")
         self.l2: float = l2
+        self.epochs = epochs  # Save the number of epochs as an attribute
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.word_to_idx = {word: i for i, word in enumerate(vocab)}
 
         # TODO: ADD CODE TO READ THE LEXICON OF WORD VECTORS AND STORE IT IN A USEFUL FORMAT.
-        self.dim: int = 99999999999  # TODO: SET THIS TO THE DIMENSIONALITY OF THE VECTORS
+                # Initialize dictionaries to hold the word indices and their embeddings
+        words_to_idx = {}
+        embeddings_lst = []
+        
+        # Read the lexicon file
+        with open(lexicon_file) as f:
+            first_line = next(f).strip()
+            num_words, dim = map(int, first_line.split())
+            
+            for i, line in enumerate(f):
+                parts = line.split()
+                word = parts[0]
+                embedding = list(map(float, parts[1:]))
+                words_to_idx[word] = i 
+                embeddings_lst.append(embedding)
+            
+        # Convert the embeddings list into a tensor
+        self.embeddings = torch.tensor(embeddings_lst, dtype=torch.float32)
+        
+        # Set the dimensionality of the embeddings
+        self.dim: int = self.embeddings.shape[1]  # TODO: SET THIS TO THE DIMENSIONALITY OF THE VECTORS
+        # Save words_to_idx in the model
+        self.words_to_idx = words_to_idx
+
 
         # We wrap the following matrices in nn.Parameter objects.
         # This lets PyTorch know that these are parameters of the model
@@ -397,6 +426,12 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # training, but those wouldn't use nn.Parameter.
         self.X = nn.Parameter(torch.zeros((self.dim, self.dim)), requires_grad=True)
         self.Y = nn.Parameter(torch.zeros((self.dim, self.dim)), requires_grad=True)
+
+
+    def get_embedding(self, word: str) -> torch.Tensor:
+
+        idx = self.words_to_idx.get(word, self.words_to_idx.get("OOL"))
+        return self.embeddings[idx]
 
     def log_prob(self, x: Wordtype, y: Wordtype, z: Wordtype) -> float:
         """Return log p(z | xy) according to this language model."""
@@ -410,11 +445,16 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # As noted below, it's important to use a tensor for training.
         # Most of your intermediate quantities, like logits below, will
         # also be stored as tensors.  (That is normal in PyTorch, so it
-        # would be weird to append `_tensor` to their names.  We only
-        # appended `_tensor` to the name of this method to distinguish
-        # it from the class's general `log_prob` method.)
+        # would be weird to append _tensor to their names.  We only
+        # appended _tensor to the name of this method to distinguish
+        # it from the class's general log_prob method.)
 
         # TODO: IMPLEMENT ME!
+        logits = self.logits(x, y)
+        z_index = self.word_to_idx[z]
+        log_prob = logits[z_index] - torch.logsumexp(logits, dim=0)
+
+        return log_prob
         # This method should call the logits helper method.
         # You are free to define other helper methods too.
         #
@@ -434,11 +474,22 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         These are commonly known as "logits" or "log-odds": the values that you 
         exponentiate and renormalize in order to get a probability distribution."""
         # TODO: IMPLEMENT ME!
+        # Get the embeddings for x and y
+        x_embed = self.get_embedding(x)
+        y_embed = self.get_embedding(y)
+        
+        
+        vocab_size = len(self.vocab)
+        z_embeddings = torch.stack([self.get_embedding(z) for z in self.vocab])
+
+        # Logits computation from F4.1
+        logits = (x_embed @ self.X @ z_embeddings.T) + (y_embed @ self.Y @ z_embeddings.T)
+        return logits
         # Don't forget that you can create additional methods
         # that you think are useful, if you'd like.
         # It's cleaner than making this function massive.
         #
-        # The operator `@` is a nice way to write matrix multiplication:
+        # The operator @ is a nice way to write matrix multiplication:
         # you can write J @ K as shorthand for torch.mul(J, K).
         # J @ K looks more like the usual math notation.
         # 
@@ -455,11 +506,11 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
 
     def train(self, file: Path):    # type: ignore
         
-        ### Technically this method shouldn't be called `train`,
-        ### because this means it overrides not only `LanguageModel.train` (as desired)
-        ### but also `nn.Module.train` (which has a different type). 
+        ### Technically this method shouldn't be called train,
+        ### because this means it overrides not only LanguageModel.train (as desired)
+        ### but also nn.Module.train (which has a different type). 
         ### However, we won't be trying to use the latter method.
-        ### The `type: ignore` comment above tells the type checker to ignore this inconsistency.
+        ### The type: ignore comment above tells the type checker to ignore this inconsistency.
         
         # Optimization hyperparameters.
         gamma0 = 0.1  # initial learning rate
@@ -480,7 +531,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # TODO: Implement your SGD here by taking gradient steps on a sequence
         # of training examples.  Here's how to use PyTorch to make it easy:
         #
-        # To get the training examples, you can use the `read_trigrams` function
+        # To get the training examples, you can use the read_trigrams function
         # we provided, which will iterate over all N trigrams in the training
         # corpus.  (Its use is illustrated in fileprob.py.)
         #
@@ -494,26 +545,45 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         # function for backpropagation as well as accumulated gradient values
         # from backpropagation.
         #
-        # To get the gradient of this objective (∇F_i(θ)), call the `backward`
+        # To get the gradient of this objective (∇F_i(θ)), call the backward
         # method on the number you computed at the previous step.  This invokes
         # back-propagation to get the gradient of this number with respect to
         # the parameters θ.  This should be easier than implementing the
         # gradient method from the handout.
         #
         # Finally, update the parameters in the direction of the gradient, as
-        # shown in Algorithm 1 in the reading handout.  You can do this `+=`
-        # yourself, or you can call the `step` method of the `optimizer` object
+        # shown in Algorithm 1 in the reading handout.  You can do this +=
+        # yourself, or you can call the step method of the optimizer object
         # we created above.  See the reading handout for more details on this.
         #
         # For the EmbeddingLogLinearLanguageModel, you should run SGD
         # optimization for the given number of epochs and then stop.  You might 
-        # want to print progress dots using the `show_progress` method defined above.  
+        # want to print progress dots using the show_progress method defined above.  
         # Even better, you could show a graphical progress bar using the tqdm module --
         # simply iterate over
         #     tqdm.tqdm(read_trigrams(file), total=N*epochs)
         # instead of iterating over
         #     read_trigrams(file)
         #####################
+        for epoch in range(self.epochs):
+            total_loss = 0.0
+            for x, y, z in tqdm.tqdm(read_trigrams(file, self.vocab), total=N):
+                # Forward computation: log probability
+                log_prob = self.log_prob_tensor(x, y, z)
+                
+                # Loss function
+                loss = -log_prob + self.l2 * (self.X.norm(2) + self.Y.norm(2))
+                
+                # Backward computation
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Update parameters
+                optimizer.step()
+
+                total_loss += loss.item()
+            
+            log.info(f"Epoch {epoch + 1}/{self.epochs}, Loss: {total_loss}")
 
         log.info("done optimizing.")
 

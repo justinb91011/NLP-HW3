@@ -1,0 +1,23 @@
+23a24
+> import pickle
+33c34
+< from typing import Counter
+---
+> from typing import Counter, Collection
+42c43
+< Vocab    = Set[Wordtype]
+---
+> Vocab    = Collection[Wordtype]   # and change this to Integerizer[str]
+141c142,147
+<     return vocab
+---
+>     # Convert from an unordered Set to an ordered List.  This ensures that iterating
+>     # over the vocab will always hit the words in the same order, so that you can 
+>     # safely store a list or tensor of embeddings in that order, for example.
+>     return sorted(vocab)   
+>     # Alternatively, you could choose to represent a Vocab as an Integerizer (see above).
+>     # Then you won't need to sort, since Integerizers already have a stable iteration order.
+239c245
+<             raise ValueError(f"Type Error: expected object of type {cls} but got {type(result)} from file {model_path}")
+---
+>             raise ValueError(f"Type Error: expected object of type {cls} but got {type(model)} from file {model_path}")
