@@ -475,7 +475,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
                 log_prob = self.log_prob_tensor(x, y, z)
             
             # Loss = -log-likelihood + L2 regularization
-                l2_penalty = self.l2 * (self.X.norm(2) + self.Y.norm(2))
+                l2_penalty = 0.1 * (self.X.norm(2) + self.Y.norm(2))
                 loss = -log_prob + l2_penalty
                 
                 loss.backward()
@@ -493,105 +493,38 @@ class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
     def __init__(self, vocab: Vocab, lexicon_file: Path, l2: float, epochs: int) -> None:
         super().__init__(vocab, lexicon_file, l2, epochs)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Additional parameterr for the OOV feature
+        self.theta_oov = nn.Parameter(torch.tensor(1.0), requires_grad=True)
 
-        # A dictionary to store unigram counts
-        self.unigram_counts = {word: 0 for word in vocab}
-        self.total_unigrams = 0  # To track total number of unigrams
+        # Precompute unigram log probabilities for the vocab, with Add-1 smoothing
+        self.unigram_probs = self.compute_unigram_log_probs(vocab)
+
+    def compute_unigram_log_probs(self, vocab: Vocab) -> torch.Tensor:
+        """Compute the log-probabilities of each word in the vocabulary based on unigram frequency."""
+        total_count = sum(self.event_count[(word,)] for word in vocab) + len(vocab)
+        unigram_probs = {}
+        for word in vocab:
+            count = self.event_count[(word,)] + 1  # Add-1 smoothing
+            unigram_probs[word] = math.log(count / total_count)
+        return unigram_probs
+
+    def log_prob_tensor(self, x: Wordtype, y: Wordtype, z: Wordtype) -> TorchScalar:
+        """Override to include OOV feature and unigram log-probability feature in log-linear model."""
+        logits = self.logits(x, y)
+
+        # Add OOV feature scaling if z is OOV
+        z_index = self.word_to_idx[z]
+        if z == OOV: 
+            logits[z_index] += self.theta_oov
+
+        # Add unigram log-probability feature
+        logits[z_index] += self.unigram_probs.get(z, self.unigram_probs.get(OOV))
+
+        # Compute the final log-probability
+        log_prob = logits[z_index] - torch.logsumexp(logits, dim=0)
+
+        return log_prob
     
-        # Identify the OOV token and its index
-        self.oov_token = OOV
-        self.oov_index = self.word_to_idx[self.oov_token]
-
-        # Define learnable parameters for the new features
-        self.theta_unigram = nn.Parameter(torch.tensor(0.0, device=self.device), requires_grad=True)
-        self.theta_oov = nn.Parameter(torch.tensor(0.0, device=self.device), requires_grad=True)
-
-        # Placeholder for unigram log-probabilities tensor
-        self.unigram_log_probs_tensor = None
-
-    def update_unigram_counts(self, file: Path) -> None:
-        """Update the unigram counts based on the training corpus."""
-        for _, _, z in read_trigrams(file, self.vocab):
-            self.unigram_counts[z] += 1
-            self.total_unigrams += 1
-
-        vocab_list = list(self.vocab)  # Convert vocab set to list
-        smoothed_counts = [self.unigram_counts.get(word, 0) + 1 for word in vocab_list]
-        total_count = self.total_unigrams + len(self.vocab)
-        unigram_probs = [count / total_count for count in smoothed_counts]
-
-
-        # self.word_to_vocab_list_idx = {word: idx for idx, word in enumerate(vocab_list)}
-        # Create tensor of log-unigram probabilities
-        self.unigram_log_probs_tensor = torch.tensor(
-            [math.log(prob) for prob in unigram_probs],
-            dtype=torch.float32,
-            device=self.device
-        )
-
-    def logits(self, x: Wordtype, y: Wordtype) -> Float[torch.Tensor, "vocab"]:
-        """Compute logits including the unigram log-probability and OOV features."""
-
-        x_embed = self.get_embedding(x)
-        y_embed = self.get_embedding(y)
-
-        logits_embed = (x_embed @ self.X @ self.z_embeddings.T) + (y_embed @ self.Y @ self.z_embeddings.T)
-
-        # vocab_list = list(self.vocab)
-        # z_indices = [self.word_to_vocab_list_idx[word] for word in vocab_list]
-
-        # Add the unigram log-probability feature, scaled by theta_unigram
-        logits = logits_embed + self.theta_unigram * self.unigram_log_probs_tensor 
-
-        # Add the OOV feature, scaled by theta_oov
-        oov_feature = torch.zeros_like(logits, device=self.device)
-        oov_feature[self.oov_index] = 1.0
-        logits += self.theta_oov * oov_feature
-
-        return logits
-
-
-    def train(self, file: Path):
-        """Train the model with the improved features."""
-
-        # Update unigram counts and precompute unigram log-probabilities
-        self.update_unigram_counts(file)
-
-        # Use Adam optimizer
-        optimizer = optim.Adam(self.parameters(), lr=1e-2)
-
-        # Initialize the parameter matrices
-        nn.init.xavier_uniform_(self.X)
-        nn.init.xavier_uniform_(self.Y)
-
-        N = num_tokens(file)
-        print(f"Training on corpus file: {file}")
-
-        for epoch in range(self.epochs):
-            total_loss = 0.0
-            for x, y, z in tqdm.tqdm(read_trigrams(file, self.vocab), total=N):
-                # Forward pass: compute log probability
-                log_prob = self.log_prob_tensor(x, y, z)
-
-                # Loss = -log-likelihood + L2 regularization
-                l2_penalty = self.l2 * (
-                    self.X.norm(2)**2 + self.Y.norm(2)**2 +
-                    self.theta_unigram.norm(2)**2 + self.theta_oov.norm(2)**2
-                )
-                loss = -log_prob + l2_penalty
-
-                # Backward and optimize
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-
-            average_loss = -total_loss / N
-            print(f"Epoch: {epoch + 1} Average Loss: {average_loss}")
-
-        print(f"Finished training on {N} tokens")
         
     # This is where you get to come up with some features of your own, as
     # described in the reading handout.  This class inherits from
