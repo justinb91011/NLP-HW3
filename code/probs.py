@@ -352,7 +352,7 @@ class BackoffAddLambdaLanguageModel(AddLambdaLanguageModel):
         if bigram_count > 0:
             # Trigram probability with add-λ smoothing and backoff to bigram
             p_bigram = self.prob_bigram(y, z)
-            return (trigram_count + self.lambda_ * p_bigram) / (bigram_count + self.lambda_ * self.vocab_size)
+            return (trigram_count + self.lambda_ * self.vocab_size * p_bigram) / (bigram_count + self.lambda_ * self.vocab_size)
         else:
             # Back off directly to bigram model
             return self.prob_bigram(y, z)
@@ -365,7 +365,7 @@ class BackoffAddLambdaLanguageModel(AddLambdaLanguageModel):
         if unigram_count > 0:
             # Bigram probability with add-λ smoothing and backoff to unigram
             p_unigram = self.prob_unigram(z)
-            return (bigram_count + self.lambda_ * p_unigram) / (unigram_count + self.lambda_ * self.vocab_size)
+            return (bigram_count + self.lambda_ * self.vocab_size * p_unigram) / (unigram_count + self.lambda_ * self.vocab_size)
         else:
             # Back off directly to unigram model
             return self.prob_unigram(z)
@@ -375,8 +375,9 @@ class BackoffAddLambdaLanguageModel(AddLambdaLanguageModel):
         unigram_count = self.event_count[(z,)]
         total_count = self.event_count[()]
         if total_count > 0:
-            # Add-λ smoothing for unigram
-            return (unigram_count + self.lambda_) / (total_count + self.lambda_ * self.vocab_size)
+            # Add-λ smoothing for unigram with backoff to uniform distribution
+            p_uniform = 1 / self.vocab_size
+            return (unigram_count + self.lambda_ * self.vocab_size * p_uniform) / (total_count + self.lambda_ * self.vocab_size)
         else:
             # Back off to uniform distribution if no counts exist
             return 1 / self.vocab_size
@@ -421,27 +422,16 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
 
         self.z_embeddings = torch.stack([self.get_embedding(z) for z in self.vocab])
         
-
-        # We wrap the following matrices in nn.Parameter objects.
-        # This lets PyTorch know that these are parameters of the model
-        # that should be listed in self.parameters() and will be
-        # updated during training.
-        #
-        # We can also store other tensors in the model class,
-        # like constant coefficients that shouldn't be altered by
-        # training, but those wouldn't use nn.Parameter.
         self.X = nn.Parameter(torch.zeros((self.dim, self.dim)), requires_grad=True)
         self.Y = nn.Parameter(torch.zeros((self.dim, self.dim)), requires_grad=True)
 
 
     def get_embedding(self, word: str) -> torch.Tensor:
-
         idx = self.words_to_idx.get(word, self.words_to_idx.get("OOL"))
         return self.embeddings[idx]
 
     def log_prob(self, x: Wordtype, y: Wordtype, z: Wordtype) -> float:
         """Return log p(z | xy) according to this language model."""
-        # https://pytorch.org/docs/stable/generated/torch.Tensor.item.html
         return self.log_prob_tensor(x, y, z).item()
 
     @typechecked
@@ -468,7 +458,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         
 
     def train(self, file: Path):
-        gamma0 = 1e-5  # learning rate
+        gamma0 = 1e-2  # learning rate
         optimizer = optim.SGD(self.parameters(), lr=gamma0)
 
         # Initialize the parameter matrices
@@ -503,9 +493,22 @@ class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
     def __init__(self, vocab: Vocab, lexicon_file: Path, l2: float, epochs: int) -> None:
         super().__init__(vocab, lexicon_file, l2, epochs)
 
-        # A dictionary to store unigram counts 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # A dictionary to store unigram counts
         self.unigram_counts = {word: 0 for word in vocab}
-        self.total_unigrams = 0 # To track total number of unigrams 
+        self.total_unigrams = 0  # To track total number of unigrams
+    
+        # Identify the OOV token and its index
+        self.oov_token = OOV
+        self.oov_index = self.word_to_idx[self.oov_token]
+
+        # Define learnable parameters for the new features
+        self.theta_unigram = nn.Parameter(torch.tensor(0.0, device=self.device), requires_grad=True)
+        self.theta_oov = nn.Parameter(torch.tensor(0.0, device=self.device), requires_grad=True)
+
+        # Placeholder for unigram log-probabilities tensor
+        self.unigram_log_probs_tensor = None
 
     def update_unigram_counts(self, file: Path) -> None:
         """Update the unigram counts based on the training corpus."""
@@ -513,48 +516,83 @@ class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
             self.unigram_counts[z] += 1
             self.total_unigrams += 1
 
-    def unigram_log_prob(self, z: Wordtype) -> float:
-        """Return the log of the smoothed unigram probability of z."""
-        count_z = self.unigram_counts.get(z, 0)
-        smoothed_count = count_z + 1  # Add-1 smoothing
-        return math.log(smoothed_count / (self.total_unigrams + len(self.vocab)))
+        vocab_list = list(self.vocab)  # Convert vocab set to list
+        smoothed_counts = [self.unigram_counts.get(word, 0) + 1 for word in vocab_list]
+        total_count = self.total_unigrams + len(self.vocab)
+        unigram_probs = [count / total_count for count in smoothed_counts]
+
+
+        # self.word_to_vocab_list_idx = {word: idx for idx, word in enumerate(vocab_list)}
+        # Create tensor of log-unigram probabilities
+        self.unigram_log_probs_tensor = torch.tensor(
+            [math.log(prob) for prob in unigram_probs],
+            dtype=torch.float32,
+            device=self.device
+        )
 
     def logits(self, x: Wordtype, y: Wordtype) -> Float[torch.Tensor, "vocab"]:
-        """Return a vector of logits, including the OOV and unigram log-probability features."""
+        """Compute logits including the unigram log-probability and OOV features."""
 
-        # Get the embeddings for x and y
         x_embed = self.get_embedding(x)
         y_embed = self.get_embedding(y)
 
-        # Compute the original logits from the embeddings
-        logits = (x_embed @ self.X @ self.z_embeddings.T) + (y_embed @ self.Y @ self.z_embeddings.T)
+        logits_embed = (x_embed @ self.X @ self.z_embeddings.T) + (y_embed @ self.Y @ self.z_embeddings.T)
 
-        # OOV feature: Add a bonus to the logit for OOV words
-        oov_index = self.word_to_idx.get("OOV", None)
-        if oov_index is not None:
-            oov_bonus = torch.zeros_like(logits)
-            oov_bonus[oov_index] = 1
-            logits += oov_bonus * torch.tensor(1.0)
+        # vocab_list = list(self.vocab)
+        # z_indices = [self.word_to_vocab_list_idx[word] for word in vocab_list]
 
-        # Unigram log-probability feature: Add to each word's logit based on its unigram log-probability
-        unigram_log_probs = torch.tensor(
-            [self.unigram_log_prob(z) for z in self.vocab],
-            dtype=torch.float32
-        ).to(self.device)
-        logits += unigram_log_probs
+        # Add the unigram log-probability feature, scaled by theta_unigram
+        logits = logits_embed + self.theta_unigram * self.unigram_log_probs_tensor 
+
+        # Add the OOV feature, scaled by theta_oov
+        oov_feature = torch.zeros_like(logits, device=self.device)
+        oov_feature[self.oov_index] = 1.0
+        logits += self.theta_oov * oov_feature
 
         return logits
 
-    def train(self, file: Path):
-        """Override the train method to update unigram counts before training."""
 
-        # Update unigram counts before training
+    def train(self, file: Path):
+        """Train the model with the improved features."""
+
+        # Update unigram counts and precompute unigram log-probabilities
         self.update_unigram_counts(file)
 
-        super().train(file)   # Call the original train method to perform training
+        # Use Adam optimizer
+        optimizer = optim.Adam(self.parameters(), lr=1e-2)
 
+        # Initialize the parameter matrices
+        nn.init.xavier_uniform_(self.X)
+        nn.init.xavier_uniform_(self.Y)
 
+        N = num_tokens(file)
+        print(f"Training on corpus file: {file}")
 
+        for epoch in range(self.epochs):
+            total_loss = 0.0
+            for x, y, z in tqdm.tqdm(read_trigrams(file, self.vocab), total=N):
+                # Forward pass: compute log probability
+                log_prob = self.log_prob_tensor(x, y, z)
+
+                # Loss = -log-likelihood + L2 regularization
+                l2_penalty = self.l2 * (
+                    self.X.norm(2)**2 + self.Y.norm(2)**2 +
+                    self.theta_unigram.norm(2)**2 + self.theta_oov.norm(2)**2
+                )
+                loss = -log_prob + l2_penalty
+
+                # Backward and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            average_loss = -total_loss / N
+            print(f"Epoch: {epoch + 1} Average Loss: {average_loss}")
+
+        print(f"Finished training on {N} tokens")
+        
     # This is where you get to come up with some features of your own, as
     # described in the reading handout.  This class inherits from
     # EmbeddingLogLinearLanguageModel and you can override anything, such as
