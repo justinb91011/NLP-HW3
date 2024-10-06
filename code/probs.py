@@ -347,21 +347,27 @@ class BackoffAddLambdaLanguageModel(AddLambdaLanguageModel):
     def prob(self, x: Wordtype, y: Wordtype, z: Wordtype) -> float:
         trigram_count = self.event_count[(x, y, z)]
         bigram_count = self.context_count[(x, y)]
+        
+        # If we have seen the bigram context (x, y)
         if bigram_count > 0:
-            # Add-λ smoothing for trigram without lower-order probabilities
-            return (trigram_count + self.lambda_) / (bigram_count + self.lambda_ * self.vocab_size)
+            # Trigram probability with add-λ smoothing and backoff to bigram
+            p_bigram = self.prob_bigram(y, z)
+            return (trigram_count + self.lambda_ * p_bigram) / (bigram_count + self.lambda_ * self.vocab_size)
         else:
-            # Back off to bigram if trigram context unseen
+            # Back off directly to bigram model
             return self.prob_bigram(y, z)
 
     def prob_bigram(self, y: Wordtype, z: Wordtype) -> float:
         bigram_count = self.event_count[(y, z)]
         unigram_count = self.context_count[(y,)]
+        
+        # If we have seen the unigram context (y)
         if unigram_count > 0:
-            # Add-λ smoothing for bigram without lower-order probabilities
-            return (bigram_count + self.lambda_) / (unigram_count + self.lambda_ * self.vocab_size)
+            # Bigram probability with add-λ smoothing and backoff to unigram
+            p_unigram = self.prob_unigram(z)
+            return (bigram_count + self.lambda_ * p_unigram) / (unigram_count + self.lambda_ * self.vocab_size)
         else:
-            # Back off to unigram if bigram context unseen
+            # Back off directly to unigram model
             return self.prob_unigram(z)
     
     def prob_unigram(self, z: Wordtype) -> float:
