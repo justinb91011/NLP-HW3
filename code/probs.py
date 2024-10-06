@@ -479,7 +479,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
                 log_prob = self.log_prob_tensor(x, y, z)
             
             # Loss = -log-likelihood + L2 regularization
-                l2_penalty = 0.5 * (self.X.norm(2) + self.Y.norm(2))
+                l2_penalty = self.l2 * (self.X.norm(2) + self.Y.norm(2))
                 loss = -log_prob + l2_penalty
                 
                 loss.backward()
@@ -494,82 +494,82 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
 
 
 class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
-    def __init__(self, vocab: Vocab, lexicon_file: Path, l2: float, epochs: int) -> None:
-        super().__init__(vocab, lexicon_file, l2, epochs)
+    def __init__(self, vocab: Vocab, lexicon_file: Path, l2: float, epochs: int) -> None:
+        super().__init__(vocab, lexicon_file, l2, epochs)
 
-        # A dictionary to store unigram counts 
-        self.unigram_counts = {word: 0 for word in vocab}
-        self.total_unigrams = 0 # To track total number of unigrams 
-      
-    def update_unigram_counts(self, file: Path) -> None:
-        """Update the unigram counts based on the training corpus."""
-        for _, _, z in read_trigrams(file, self.vocab):
-          self.unigram_counts[z] += 1
-          self.total_unigrams += 1
-    
-    def unigram_log_prob(self, z: Wordtype) -> float:
-        """Return the log of the smoothed unigram probability of z."""
-        count_z = self.unigram_counts.get(z, 0)
-        smoothed_count = count_z + 1  # Add-1 smoothing
-        return math.log(smoothed_count / (self.total_unigrams + len(self.vocab)))
+        # A dictionary to store unigram counts 
+        self.unigram_counts = {word: 0 for word in vocab}
+        self.total_unigrams = 0 # To track total number of unigrams 
 
-    def logits(self, x: Wordtype, y: Wordtype) -> Float[torch.Tensor, "vocab"]:
-        """Return a vector of logits, including the OOV and unigram log-probability features."""
+    def update_unigram_counts(self, file: Path) -> None:
+        """Update the unigram counts based on the training corpus."""
+        for _, _, z in read_trigrams(file, self.vocab):
+            self.unigram_counts[z] += 1
+            self.total_unigrams += 1
 
-        # Get the embeddings for x and y
-        x_embed = self.get_embedding(x)
-        y_embed = self.get_embedding(y)
+    def unigram_log_prob(self, z: Wordtype) -> float:
+        """Return the log of the smoothed unigram probability of z."""
+        count_z = self.unigram_counts.get(z, 0)
+        smoothed_count = count_z + 1  # Add-1 smoothing
+        return math.log(smoothed_count / (self.total_unigrams + len(self.vocab)))
 
-        # Compute the original logits from the embeddings
-        logits = (x_embed @ self.X @ self.z_embeddings.T) + (y_embed @ self.Y @ self.z_embeddings.T)
+    def logits(self, x: Wordtype, y: Wordtype) -> Float[torch.Tensor, "vocab"]:
+        """Return a vector of logits, including the OOV and unigram log-probability features."""
 
-        # OOV feature: Add a bonus to the logit for OOV words
-        oov_index = self.word_to_idx.get("OOV", None)
-        if oov_index is not None:
-          oov_bonus = torch.zeros_like(logits)
-          oov_bonus[oov_index] = 1
-          logits += oov_bonus * torch.tensor(1.0)
+        # Get the embeddings for x and y
+        x_embed = self.get_embedding(x)
+        y_embed = self.get_embedding(y)
 
-        # Unigram log-probability feature: Add to each word's logit based on its unigram log-probability
-        unigram_log_probs = torch.tensor(
-            [self.unigram_log_prob(z) for z in self.vocab],
-            dtype=torch.float32
-        ).to(self.device)
-        logits += unigram_log_probs
+        # Compute the original logits from the embeddings
+        logits = (x_embed @ self.X @ self.z_embeddings.T) + (y_embed @ self.Y @ self.z_embeddings.T)
 
-        return logits
+        # OOV feature: Add a bonus to the logit for OOV words
+        oov_index = self.word_to_idx.get("OOV", None)
+        if oov_index is not None:
+            oov_bonus = torch.zeros_like(logits)
+            oov_bonus[oov_index] = 1
+            logits += oov_bonus * torch.tensor(1.0)
 
-    def train(self, file: Path):
-        """Override the train method to update unigram counts before training."""
+        # Unigram log-probability feature: Add to each word's logit based on its unigram log-probability
+        unigram_log_probs = torch.tensor(
+            [self.unigram_log_prob(z) for z in self.vocab],
+            dtype=torch.float32
+        ).to(self.device)
+        logits += unigram_log_probs
 
-        # Update unigram counts before training
-        self.update_unigram_counts(file)
+        return logits
 
-        super().train(file)  # Call the original train method to perform training
+    def train(self, file: Path):
+        """Override the train method to update unigram counts before training."""
+
+        # Update unigram counts before training
+        self.update_unigram_counts(file)
+
+        super().train(file)   # Call the original train method to perform training
 
 
-    
-    # This is where you get to come up with some features of your own, as
-    # described in the reading handout.  This class inherits from
-    # EmbeddingLogLinearLanguageModel and you can override anything, such as
-    # `log_prob`.
 
-    # OTHER OPTIONAL IMPROVEMENTS: You could override the `train` method.
-    # Instead of using 10 epochs, try "improving the SGD training loop" as
-    # described in the reading handout.  Some possibilities:
-    #
-    # * You can use the `draw_trigrams_forever` function that we
-    #   provided to shuffle the trigrams on each epoch.
-    #
-    # * You can choose to compute F_i using a mini-batch of trigrams
-    #   instead of a single trigram, and try to vectorize the computation
-    #   over the mini-batch.
-    #
-    # * Instead of running for exactly 10*N trigrams, you can implement
-    #   early stopping by giving the `train` method access to dev data.
-    #   This will run for as long as continued training is helpful,
-    #   so it might run for more or fewer than 10*N trigrams.
-    #
-    # * You could use a different optimization algorithm instead of SGD, such
-    #   as `torch.optim.Adam` (https://pytorch.org/docs/stable/optim.html).
-    #
+    # This is where you get to come up with some features of your own, as
+    # described in the reading handout.  This class inherits from
+    # EmbeddingLogLinearLanguageModel and you can override anything, such as
+    # `log_prob`.
+
+    # OTHER OPTIONAL IMPROVEMENTS: You could override the `train` method.
+    # Instead of using 10 epochs, try "improving the SGD training loop" as
+    # described in the reading handout.  Some possibilities:
+    #
+    # * You can use the `draw_trigrams_forever` function that we
+    #   provided to shuffle the trigrams on each epoch.
+    #
+    # * You can choose to compute F_i using a mini-batch of trigrams
+    #   instead of a single trigram, and try to vectorize the computation
+    #   over the mini-batch.
+    #
+    # * Instead of running for exactly 10*N trigrams, you can implement
+    #   early stopping by giving the `train` method access to dev data.
+    #   This will run for as long as continued training is helpful,
+    #   so it might run for more or fewer than 10*N trigrams.
+    #
+    # * You could use a different optimization algorithm instead of SGD, such
+    #   as `torch.optim.Adam` (https://pytorch.org/docs/stable/optim.html).
+    #
