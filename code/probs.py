@@ -493,8 +493,12 @@ class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
     def __init__(self, vocab: Vocab, lexicon_file: Path, l2: float, epochs: int) -> None:
         super().__init__(vocab, lexicon_file, l2, epochs)
 
-        # Additional parameterr for the OOV feature
+        # Additional parameter for the OOV feature
         self.theta_oov = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+
+        # Learned embeddings specifically for OOV context words
+        self.x_oov = nn.Parameter(torch.randn(self.dim), requires_grad=True)  # OOV embedding for x
+        self.y_oov = nn.Parameter(torch.randn(self.dim), requires_grad=True)  # OOV embedding for y
 
         # Precompute unigram log probabilities for the vocab, with Add-1 smoothing
         self.unigram_probs = self.compute_unigram_log_probs(vocab)
@@ -507,6 +511,23 @@ class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
             count = self.event_count[(word,)] + 1  # Add-1 smoothing
             unigram_probs[word] = math.log(count / total_count)
         return unigram_probs
+
+    
+    def logits(self, x: Wordtype, y: Wordtype) -> Float[torch.Tensor, "vocab"]:
+        """Override logits computation to handle OOV context with learned embeddings."""
+        if x == OOV:
+            x_embed = self.x_oov  # Use learned OOV embedding for x
+        else:
+            x_embed = self.get_embedding(x)
+
+        if y == OOV:
+            y_embed = self.y_oov  # Use learned OOV embedding for y
+        else:
+            y_embed = self.get_embedding(y)
+
+        logits = (x_embed @ self.X @ self.z_embeddings.T) + (y_embed @ self.Y @ self.z_embeddings.T)
+        return logits
+
 
     def log_prob_tensor(self, x: Wordtype, y: Wordtype, z: Wordtype) -> TorchScalar:
         """Override to include OOV feature and unigram log-probability feature in log-linear model."""
@@ -524,8 +545,6 @@ class ImprovedLogLinearLanguageModel(EmbeddingLogLinearLanguageModel):
         log_prob = logits[z_index] - torch.logsumexp(logits, dim=0)
 
         return log_prob
-    
-        
     # This is where you get to come up with some features of your own, as
     # described in the reading handout.  This class inherits from
     # EmbeddingLogLinearLanguageModel and you can override anything, such as
