@@ -109,6 +109,38 @@ def read_trigrams(file: Path, vocab: Vocab) -> Iterable[Trigram]:
             x, y = y, z  # shift over by one position.
 
 
+def read_transcription_candidates(file: Path) -> Iterable[Tuple[float, str, bool]]:
+    """Read the candidates from the given speech recognition file."""
+    
+    candidates = []
+    with open(file, "r") as f:
+        lines = f.readlines()
+        
+        # Assume the first transcription is the correct one
+        correct_transcription = True
+        
+        # Skip the first row entirely, as per the instruction
+        for i, line in enumerate(lines[1:], start=1):  
+            parts = line.split(maxsplit=3)  # Split into log-likelihood, num_words, transcription
+            log_likelihood = float(parts[1])  # Log-likelihood is the second value (after skipping WER)
+            num_words = int(parts[2])  # Number of words is the third value
+            transcription = parts[3].strip()  # The rest is the transcription
+            # The first transcription is correct, rest are candidates
+            candidates.append((log_likelihood, transcription, correct_transcription))
+            correct_transcription = False  # Only the first transcription is correct, mark the rest as false
+    return candidates
+
+def read_trigrams_from_sentence(sentence: List[Wordtype], vocab: Vocab) -> Iterable[Trigram]:
+    """Similar to read_trigrams but works on a list of tokens (a single sentence)."""
+    x, y = BOS, BOS
+    for z in sentence:
+        yield (x, y, z)
+        if z == EOS:
+            x, y = BOS, BOS
+        else:
+            x, y = y, z
+
+
 def draw_trigrams_forever(file: Path, 
                           vocab: Vocab, 
                           randomize: bool = False) -> Iterable[Trigram]:
@@ -458,7 +490,7 @@ class EmbeddingLogLinearLanguageModel(LanguageModel, nn.Module):
         
 
     def train(self, file: Path):
-        gamma0 = 1e-2  # learning rate
+        gamma0 = 1e-5  # learning rate
         optimizer = optim.SGD(self.parameters(), lr=gamma0)
 
         # Initialize the parameter matrices
